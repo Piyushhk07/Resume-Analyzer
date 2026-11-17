@@ -1604,7 +1604,7 @@ def download_pdf(filename):
 
 @app.route('/health')
 def health():
-    return jsonify({'status': 'ok', 'model': GEMINI_MODEL})
+    return jsonify({'status': 'ok', 'model': GEMINI_MODELS[0], 'models': GEMINI_MODELS})
 
 
 # ─────────────────────────────────────────────
