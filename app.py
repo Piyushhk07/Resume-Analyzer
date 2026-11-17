@@ -73,12 +73,13 @@ if not GEMINI_API_KEYS:
 
 _key_index = 0  # tracks which key is currently active
 
-GEMINI_MODEL = 'gemini-3.8-flash'   # updated — gemini-3.6-flash deprecated per Google
-
-GEMINI_API_URL = (
-    'https://generativelanguage.googleapis.com/v1beta/models/'
-    f'{GEMINI_MODEL}:generateContent'
-)
+# Multi-model pool for automatic resilience against 503 high-demand spikes & model transitions
+GEMINI_MODELS = [
+    'gemini-3.1-flash-lite-preview',
+    'gemini-3.5-flash-lite',
+    'gemini-flash-lite-latest',
+    'gemini-3.8-flash',
+]
 
 # ─────────────────────────────────────────────
 # Career Stage Rubrics
@@ -310,9 +311,9 @@ def extract_text_from_pdf(filepath: str) -> str:
 
 def call_gemini(prompt: str, expect_json: bool = True, temperature: float = 0.3) -> str:
     """
-    Send a prompt to Gemini and return the response text.
-    On 429, rotates API keys and retries with exponential backoff.
-    Raises RuntimeError on final failure.
+    Send a prompt to Gemini with automated model fallback and API key rotation.
+    Cycles through candidate models if Google returns 503 (high demand) or 404.
+    Rotates keys on 429 rate limits.
     """
     global _key_index
 
@@ -326,171 +327,73 @@ def call_gemini(prompt: str, expect_json: bool = True, temperature: float = 0.3)
     if expect_json:
         gen_config['responseMimeType'] = 'application/json'
 
-    total_attempts = len(GEMINI_API_KEYS) * 2  # try each key twice max
+    last_error = None
 
-    for attempt in range(total_attempts):
-        current_key = GEMINI_API_KEYS[_key_index % len(GEMINI_API_KEYS)]
-        try:
-            resp = requests.post(
-                GEMINI_API_URL,
-                params={'key': current_key},
-                json={
-                    'contents': [{'parts': [{'text': prompt}]}],
-                    'generationConfig': gen_config,
-                },
-                timeout=90   # reduced: Gunicorn timeout=180, leave headroom
-            )
+    for model in GEMINI_MODELS:
+        url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent'
+        for attempt in range(len(GEMINI_API_KEYS)):
+            current_key = GEMINI_API_KEYS[(_key_index + attempt) % len(GEMINI_API_KEYS)]
+            try:
+                resp = requests.post(
+                    url,
+                    params={'key': current_key},
+                    json={
+                        'contents': [{'parts': [{'text': prompt}]}],
+                        'generationConfig': gen_config,
+                    },
+                    timeout=25   # Fast 25s timeout allows trying fallback models before Gunicorn timeout
+                )
 
-            if resp.status_code == 404:
-                err_data = resp.json() if resp.headers.get('content-type', '').startswith('application/json') else {}
-                err_msg = err_data.get('error', {}).get('message', 'Model not found.')
-                raise RuntimeError(f'Gemini model not available: {err_msg}')
+                if resp.status_code == 200:
+                    data = resp.json()
+                    candidates = data.get('candidates', [])
+                    if candidates:
+                        parts = candidates[0].get('content', {}).get('parts', [])
+                        answer_parts = [p.get('text', '') for p in parts if not p.get('thought', False)]
+                        if answer_parts:
+                            _key_index = (_key_index + attempt) % len(GEMINI_API_KEYS)
+                            return ''.join(answer_parts)
+                    continue
 
-            if resp.status_code == 429:
-                err_body = ''
-                try:
-                    err_body = str(resp.json())
-                except Exception:
-                    pass
+                if resp.status_code in (404, 503):
+                    print(f"[Gemini] Model {model} returned {resp.status_code}, falling back to next model...")
+                    break  # try next model in GEMINI_MODELS
 
-                # Daily quota exhausted — no point retrying or sleeping
-                if 'PerDay' in err_body or 'per_day' in err_body.lower() or 'daily' in err_body.lower():
-                    raise RuntimeError(
-                        'Gemini API daily quota exhausted. '
-                        'Please create a new API key at https://aistudio.google.com/app/apikey '
-                        'or wait until tomorrow for the quota to reset.'
-                    )
+                if resp.status_code == 429:
+                    err_body = str(resp.json()) if resp.headers.get('content-type', '').startswith('application/json') else ''
+                    if 'PerDay' in err_body or 'per_day' in err_body.lower() or 'daily' in err_body.lower():
+                        continue  # try next key
+                    time.sleep(1)
+                    continue
 
-                # Per-minute rate limit — rotate key and retry with short wait
-                retry_after = resp.headers.get('Retry-After')
-                wait = int(retry_after) if retry_after else min(5 * (2 ** attempt), 20)
-                _key_index = (_key_index + 1) % len(GEMINI_API_KEYS)
-                print(f'[Gemini] 429 rate limit, rotating key, waiting {wait}s (attempt {attempt+1}/{total_attempts})')
-                time.sleep(wait)
+                if resp.status_code in (400, 403):
+                    err_data = resp.json() if resp.headers.get('content-type', '').startswith('application/json') else {}
+                    err_msg = err_data.get('error', {}).get('message', '')
+                    if 'API_KEY_INVALID' in str(err_data) or 'API key not valid' in err_msg:
+                        continue  # try next key
+                    last_error = f"Gemini Error ({resp.status_code}): {err_msg}"
+                    break
+
+            except requests.exceptions.Timeout:
+                print(f"[Gemini] Model {model} timed out after 25s, trying next model...")
+                break
+            except Exception as e:
+                last_error = str(e)
                 continue
-
-            if resp.status_code in (400, 403):
-                err_data = resp.json() if resp.headers.get('content-type', '').startswith('application/json') else {}
-                err_msg = err_data.get('error', {}).get('message', '')
-                if 'API_KEY_INVALID' in str(err_data) or 'API key not valid' in err_msg:
-                    raise RuntimeError('Invalid Gemini API key. Please check your GEMINI_API_KEYS in .env or Render environment variables.')
-                raise RuntimeError(f'Gemini API Error ({resp.status_code}): {err_msg or resp.text}')
-
-            resp.raise_for_status()
-            parts = resp.json()['candidates'][0]['content']['parts']
-            # Filter out thought parts from thinking models
-            answer_parts = [p.get('text', '') for p in parts if not p.get('thought', False)]
-            return ''.join(answer_parts)
-
-        except RuntimeError:
-            raise
-        except requests.exceptions.Timeout:
-            raise RuntimeError('Gemini API timed out after 90 seconds. Please try again.')
-        except Exception as e:
-            error_str = str(e)
-            if '429' in error_str or 'rate' in error_str.lower():
-                wait = min(10 * (2 ** attempt), 60)
-                _key_index = (_key_index + 1) % len(GEMINI_API_KEYS)
-                print(f"[Gemini] Rate error on attempt {attempt + 1}, rotating key, waiting {wait}s...")
-                time.sleep(wait)
-                continue
-            raise RuntimeError(f'Gemini API error: {error_str}')
 
     raise RuntimeError(
-        'Gemini API quota exceeded. Your free-tier daily quota is exhausted. '
-        'Options: (1) Wait until tomorrow for quota to reset, '
-        '(2) Create a fresh API key at https://aistudio.google.com/app/apikey, '
-        'or (3) Enable billing in Google Cloud Console.'
+        last_error or
+        'Gemini API daily quota exhausted or models temporarily experiencing high demand. '
+        'Please check your API key at https://aistudio.google.com/app/apikey.'
     )
 
 
 def call_gemini_analysis(prompt: str) -> str:
     """
-    Same as call_gemini but uses temperature=0.7 for the analysis call
-    to ensure score variability across different resume quality levels.
+    Call Gemini with temperature=0.45 for resume analysis scoring.
+    Uses the same resilient multi-model fallback engine as call_gemini.
     """
-    global _key_index
-
-    if not GEMINI_API_KEYS:
-        raise RuntimeError('GEMINI_API_KEYS environment variable is not configured. Please set GEMINI_API_KEYS in your .env file or host environment settings.')
-
-    gen_config = {
-        'temperature': 0.45,   # 0.45: enough variability for score differentiation, low enough to keep same-text variance within ±3 pts
-        'maxOutputTokens': 8192,
-        'responseMimeType': 'application/json',
-    }
-
-    total_attempts = len(GEMINI_API_KEYS) * 2
-
-    for attempt in range(total_attempts):
-        current_key = GEMINI_API_KEYS[_key_index % len(GEMINI_API_KEYS)]
-        try:
-            resp = requests.post(
-                GEMINI_API_URL,
-                params={'key': current_key},
-                json={
-                    'contents': [{'parts': [{'text': prompt}]}],
-                    'generationConfig': gen_config,
-                },
-                timeout=90   # reduced: Gunicorn timeout=180, leave headroom
-            )
-
-            if resp.status_code == 404:
-                err_data = resp.json() if resp.headers.get('content-type', '').startswith('application/json') else {}
-                err_msg = err_data.get('error', {}).get('message', 'Model not found.')
-                raise RuntimeError(f'Gemini model not available: {err_msg}')
-
-            if resp.status_code in (400, 403):
-                err_data = resp.json() if resp.headers.get('content-type', '').startswith('application/json') else {}
-                err_msg = err_data.get('error', {}).get('message', '')
-                if 'API_KEY_INVALID' in str(err_data) or 'API key not valid' in err_msg:
-                    raise RuntimeError('Invalid Gemini API key. Please check your GEMINI_API_KEYS in .env or Render environment variables.')
-                raise RuntimeError(f'Gemini API Error ({resp.status_code}): {err_msg or resp.text}')
-
-            if resp.status_code == 429:
-                err_body = ''
-                try:
-                    err_body = str(resp.json())
-                except Exception:
-                    pass
-                if 'PerDay' in err_body or 'per_day' in err_body.lower() or 'daily' in err_body.lower():
-                    raise RuntimeError(
-                        'Gemini API daily quota exhausted. '
-                        'Please create a new API key at https://aistudio.google.com/app/apikey '
-                        'or wait until tomorrow for the quota to reset.'
-                    )
-                retry_after = resp.headers.get('Retry-After')
-                wait = int(retry_after) if retry_after else min(5 * (2 ** attempt), 20)
-                _key_index = (_key_index + 1) % len(GEMINI_API_KEYS)
-                print(f'[Gemini-Analysis] 429, rotating key, waiting {wait}s (attempt {attempt+1})')
-                time.sleep(wait)
-                continue
-
-            resp.raise_for_status()
-            parts = resp.json()['candidates'][0]['content']['parts']
-            # Filter out thought parts from thinking models
-            answer_parts = [p.get('text', '') for p in parts if not p.get('thought', False)]
-            return ''.join(answer_parts)
-
-        except RuntimeError:
-            raise
-        except requests.exceptions.Timeout:
-            raise RuntimeError('Gemini API timed out after 90 seconds. Please try again.')
-        except Exception as e:
-            error_str = str(e)
-            if '429' in error_str or 'rate' in error_str.lower():
-                wait = min(5 * (2 ** attempt), 20)
-                _key_index = (_key_index + 1) % len(GEMINI_API_KEYS)
-                print(f'[Gemini-Analysis] Rate error attempt {attempt+1}, rotating key, waiting {wait}s...')
-                time.sleep(wait)
-                continue
-            raise RuntimeError(f'Gemini API error: {error_str}')
-
-    raise RuntimeError(
-        'Gemini API daily quota exhausted. '
-        'Please create a new API key at https://aistudio.google.com/app/apikey '
-        'or wait until tomorrow for the quota to reset.'
-    )
+    return call_gemini(prompt, expect_json=True, temperature=0.45)
 
 
 def parse_json_response(raw_text: str) -> dict:
